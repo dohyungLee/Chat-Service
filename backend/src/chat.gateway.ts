@@ -9,102 +9,143 @@ import {
 } from '@nestjs/websockets'
 import { Server, Socket } from 'socket.io'
 import { ChatService } from './chat.service'
+import { JwtService } from '@nestjs/jwt'
 
-@WebSocketGateway({ cors: { origin: '*' } })
+@WebSocketGateway({
+  cors: { origin: 'http://localhost:3000', credentials: true },
+})
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer() server: Server
 
-  constructor(private chatService: ChatService) {}
+  constructor(
+    private chatService: ChatService,
+    private jwt: JwtService,
+  ) {}
 
   handleConnection(client: Socket) {
-    console.log('[WS] connected:', client.id)
+    try {
+      const token = client.handshake.auth?.token
+      if (!token) throw new Error('TOKEN_REQUIRED')
+
+      const payload = this.jwt.verify(token) as { sub?: string; userId?: string }
+      const userId = payload.sub ?? payload.userId
+      if (!userId) throw new Error('INVALID_TOKEN')
+
+      client.data.userId = userId
+      console.log('[WS] connected:', { socketId: client.id, userId })
+    } catch {
+      client.emit('auth:error', { code: 'UNAUTHORIZED' }) // ✅ 유지
+      client.disconnect()
+    }
   }
 
   handleDisconnect(client: Socket) {
-    console.log('[WS] disconnected:', client.id)
+    console.log('[WS] disconnected:', { socketId: client.id, userId: client.data.userId })
   }
 
   @SubscribeMessage('room:join')
-  async onJoin(
-    @MessageBody() body: { roomId: string; nickname?: string },
-    @ConnectedSocket() client: Socket,
-  ) {
+  async onJoin(@MessageBody() body: { roomId: string }, @ConnectedSocket() client: Socket) {
+    const userId = client.data.userId as string | undefined
+    if (!userId) return client.disconnect()
+
     const roomKey = (body?.roomId || '').trim()
     if (!roomKey) return client.emit('room:error', { code: 'ROOM_ID_REQUIRED' })
+
+    await this.chatService.joinRoom(roomKey, userId)
 
     await client.join(roomKey)
     const size = this.server.sockets.adapter.rooms.get(roomKey)?.size ?? 0
 
-    client.emit('room:joined', { roomId: roomKey, clientId: client.id, size })
-    client.to(roomKey).emit('room:user-joined', { roomId: roomKey, clientId: client.id, size })
+    client.emit('room:joined', { roomId: roomKey, size })
+    client.to(roomKey).emit('room:user-joined', { roomId: roomKey, size })
   }
 
   @SubscribeMessage('room:leave')
-  async onLeave(
-    @MessageBody() body: { roomId: string },
-    @ConnectedSocket() client: Socket,
-  ) {
+  async onLeave(@MessageBody() body: { roomId: string }, @ConnectedSocket() client: Socket) {
+    const userId = client.data.userId as string | undefined
+    if (!userId) return client.disconnect()
+
     const roomKey = (body?.roomId || '').trim()
     if (!roomKey) return client.emit('room:error', { code: 'ROOM_ID_REQUIRED' })
+
+    await this.chatService.leaveRoom(roomKey, userId)
 
     await client.leave(roomKey)
     const size = this.server.sockets.adapter.rooms.get(roomKey)?.size ?? 0
 
-    client.emit('room:left', { roomId: roomKey, clientId: client.id, size })
-    client.to(roomKey).emit('room:user-left', { roomId: roomKey, clientId: client.id, size })
+    client.emit('room:left', { roomId: roomKey, size })
+    client.to(roomKey).emit('room:user-left', { roomId: roomKey, size })
   }
 
-  // ✅ DB 저장 후 방 전체 브로드캐스트
   @SubscribeMessage('message:send')
   async onSend(
     @MessageBody() body: { roomId: string; text: string },
     @ConnectedSocket() client: Socket,
   ) {
+    const userId = client.data.userId as string | undefined
+    if (!userId) return client.disconnect()
+
     const roomKey = (body?.roomId || '').trim()
     const text = (body?.text || '').trim()
 
     if (!roomKey) return client.emit('message:error', { code: 'ROOM_ID_REQUIRED' })
     if (!text) return client.emit('message:error', { code: 'TEXT_REQUIRED' })
 
-    const saved = await this.chatService.saveMessage({
-      roomKey,
-      senderId: client.id,
-      text,
-    })
+    try {
+      const saved = await this.chatService.saveMessage({
+        roomKey,
+        senderId: userId,
+        text,
+      })
 
-    this.server.to(roomKey).emit('message:new', {
-      roomId: saved.room.roomKey,
-      messageId: saved.id,
-      from: saved.senderId,
-      text: saved.text,
-      ts: saved.createdAt.getTime(),
-    })
+      const from =
+        saved.sender?.nickname ??
+        saved.sender?.email?.split('@')[0] ??
+        'Unknown'
+
+      this.server.to(roomKey).emit('message:new', {
+        roomId: roomKey,
+        messageId: saved.id,
+        from, // ✅ 닉네임 표시
+        text: saved.text,
+        ts: saved.createdAt.getTime(),
+      })
+    } catch {
+      client.emit('message:error', { code: 'FORBIDDEN' })
+    }
   }
 
-  // ✅ 최신/이전 메시지 페이징 조회
   @SubscribeMessage('message:history')
   async onHistory(
     @MessageBody() body: { roomId: string; size?: number; before?: string },
     @ConnectedSocket() client: Socket,
   ) {
+    const userId = client.data.userId as string | undefined
+    if (!userId) return client.disconnect()
+
     const roomKey = (body?.roomId || '').trim()
     if (!roomKey) return client.emit('message:error', { code: 'ROOM_ID_REQUIRED' })
 
-    const items = await this.chatService.getMessages({
-      roomKey: roomKey,      // roomKey 변수명 사용
-      size: body.size,
-      before: body.before,
-    })
+    try {
+      const items = await this.chatService.getMessages({
+        roomKey,
+        userId,
+        size: body.size,
+        before: body.before,
+      })
 
-    client.emit('message:history', {
-      roomId: roomKey,
-      items: items.map((m) => ({
-        messageId: m.id,
-        from: m.senderId,
-        text: m.text,
-        ts: m.createdAt.getTime(),
-      })),
-      nextBefore: items.length ? items[0].id : null, // 가장 오래된 id
-    })
+      client.emit('message:history', {
+        roomId: roomKey,
+        items: items.map((m) => ({
+          messageId: m.id,
+          from: m.sender?.nickname ?? m.sender?.email?.split('@')[0] ?? 'Unknown',
+          text: m.text,
+          ts: m.createdAt.getTime(),
+        })),
+        nextBefore: items.length ? items[0].id : null,
+      })
+    } catch {
+      client.emit('message:error', { code: 'FORBIDDEN' })
+    }
   }
 }
